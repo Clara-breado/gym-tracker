@@ -1,8 +1,11 @@
 import json
+import logging
 
 from openai import AsyncAzureOpenAI
 from api.config import get_settings
 from api.models.schemas import WorkoutPlanResponse
+
+logger = logging.getLogger("gemini_service")
 
 SYSTEM_PROMPT_TEMPLATE = """You are an elite strength and conditioning coach. Your task is to generate a highly customized, dynamic workout plan strictly in JSON format. Do not rely on a fixed exercise database. Select the most optimal exercises based on biomechanics.
 
@@ -59,6 +62,9 @@ async def generate_workout_plan(
         current_doubts=profile.get("current_doubts", "None yet"),
     )
 
+    logger.info("[generate_workout_plan] INPUT body_part=%s, special_request=%s, profile=%s", body_part, special_request, json.dumps(profile, default=str))
+    logger.debug("[generate_workout_plan] FULL PROMPT:\n%s", prompt)
+
     client = AsyncAzureOpenAI(
         azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
         api_key=settings["AZURE_OPENAI_KEY"],
@@ -72,7 +78,10 @@ async def generate_workout_plan(
         response_format={"type": "json_object"},
     )
 
-    parsed_json = json.loads(response.choices[0].message.content)
+    raw_content = response.choices[0].message.content
+    logger.info("[generate_workout_plan] RAW RESPONSE:\n%s", raw_content)
+
+    parsed_json = json.loads(raw_content)
     validated = WorkoutPlanResponse.model_validate(parsed_json)
     return validated.model_dump()
 
@@ -117,6 +126,11 @@ async def reflect_on_workout(
         language=language,
     )
 
+    logger.info("[reflect_on_workout] INPUT body_part=%s, exercises_count=%d, current_profile=%s",
+                workout_data.get("body_part", ""), len(workout_data.get("exercises", [])),
+                json.dumps(current_profile, default=str))
+    logger.debug("[reflect_on_workout] FULL PROMPT:\n%s", prompt)
+
     client = AsyncAzureOpenAI(
         azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
         api_key=settings["AZURE_OPENAI_KEY"],
@@ -131,7 +145,9 @@ async def reflect_on_workout(
         max_tokens=500,
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw_content = response.choices[0].message.content
+    logger.info("[reflect_on_workout] RAW RESPONSE:\n%s", raw_content)
+    return json.loads(raw_content)
 
 
 CHAT_INSIGHT_PROMPT = """Analyze this fitness coaching conversation. Did the user reveal any NEW muscular weaknesses, form issues, pain points, or training doubts?
@@ -173,6 +189,10 @@ async def extract_chat_insights(
         current_doubts=current_profile.get("current_doubts", "None"),
     )
 
+    logger.info("[extract_chat_insights] INPUT conversation_len=%d, current_profile=%s",
+                len(conversation), json.dumps(current_profile, default=str))
+    logger.debug("[extract_chat_insights] FULL PROMPT:\n%s", prompt)
+
     client = AsyncAzureOpenAI(
         azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
         api_key=settings["AZURE_OPENAI_KEY"],
@@ -187,4 +207,6 @@ async def extract_chat_insights(
         max_tokens=300,
     )
 
-    return json.loads(response.choices[0].message.content)
+    raw_content = response.choices[0].message.content
+    logger.info("[extract_chat_insights] RAW RESPONSE:\n%s", raw_content)
+    return json.loads(raw_content)

@@ -153,7 +153,9 @@ async def chat_with_ai(request: ChatRequest, http_request: Request):
         async def _extract_and_update():
             try:
                 profile = user_profile or await cosmos_service.get_user_profile()
+                logger.info("[_extract_and_update] Starting insight extraction, conversation_len=%d", len(conversation))
                 insights = await gemini_service.extract_chat_insights(conversation, profile)
+                logger.info("[_extract_and_update] Insights result: %s", insights)
                 if insights.get("has_new_insights"):
                     existing_weak = profile.get("weak_points_and_reminders", "")
                     existing_doubts = profile.get("current_doubts", "")
@@ -164,9 +166,11 @@ async def chat_with_ai(request: ChatRequest, http_request: Request):
                     if insights.get("doubts_to_append"):
                         new_doubts = f"{existing_doubts}; {insights['doubts_to_append']}" if existing_doubts else insights["doubts_to_append"]
                     await cosmos_service.update_user_profile(new_weak, new_doubts)
-                    logger.info("Chat insights extracted and profile updated")
+                    logger.info("[_extract_and_update] Profile updated — weak_points: %s, doubts: %s", new_weak, new_doubts)
+                else:
+                    logger.info("[_extract_and_update] No new insights found, skipping profile update")
             except Exception as exc:
-                logger.warning("Background chat insight extraction failed: %s", exc)
+                logger.error("[_extract_and_update] Background chat insight extraction failed: %s", exc, exc_info=True)
 
         asyncio.create_task(_extract_and_update())
 
