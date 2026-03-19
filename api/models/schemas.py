@@ -73,3 +73,17 @@ class SuggestAlternativesRequest(BaseModel):
 class SuggestAlternativesResponse(BaseModel):
     original_exercise: str
     alternatives: list[ExercisePlan]
+
+
+class UserProfile(BaseModel):
+    id: str = "user_knowledge_base"
+    body_part: str = "global_profile"
+    fitness_goals: str = "Focus on hypertrophy and achieving a defined waistline/visible abs."
+    weak_points_and_reminders: str = ""
+    current_doubts: str = ""
+
+
+class ReflectionResponse(BaseModel):
+    weak_points_and_reminders: str
+    current_doubts: str
+    session_summary: str

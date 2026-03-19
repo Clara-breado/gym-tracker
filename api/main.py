@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -33,6 +34,13 @@ async def generate_plan(request: GeneratePlanRequest, http_request: Request):
         logger.error("Cosmos DB query failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to retrieve workout history")
 
+    # Fetch user profile for personalized coaching
+    try:
+        user_profile = await cosmos_service.get_user_profile()
+    except Exception as exc:
+        logger.warning("Failed to fetch user profile, using defaults: %s", exc)
+        user_profile = {}
+
     try:
         plan = await gemini_service.generate_workout_plan(
             body_part=request.body_part,
@@ -40,18 +48,48 @@ async def generate_plan(request: GeneratePlanRequest, http_request: Request):
             user_body_measurements=request.user_body_measurements,
             history=history,
             language=language,
+            user_profile=user_profile,
         )
     except Exception as exc:
-        logger.error("Gemini API call failed: %s", exc)
+        logger.error("AI plan generation failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to generate workout plan")
 
     return plan
 
 
 @app.post("/api/save-workout")
-async def save_workout(request: SaveWorkoutRequest):
+async def save_workout(request: SaveWorkoutRequest, http_request: Request):
+    lang = http_request.headers.get("accept-language", "en-US")
+    language = "Chinese" if lang.startswith("zh") else "English"
+
+    workout_data = request.model_dump()
+
+    # Step 1: Run AI reflection on the workout
     try:
-        document = await cosmos_service.save_workout(request.model_dump())
+        user_profile = await cosmos_service.get_user_profile()
+    except Exception as exc:
+        logger.warning("Failed to fetch profile for reflection: %s", exc)
+        user_profile = {}
+
+    try:
+        reflection = await gemini_service.reflect_on_workout(
+            workout_data=workout_data,
+            current_profile=user_profile,
+            language=language,
+        )
+        # Step 2: Update user profile with new insights
+        await cosmos_service.update_user_profile(
+            weak_points=reflection.get("weak_points_and_reminders", ""),
+            current_doubts=reflection.get("current_doubts", ""),
+        )
+        # Step 3: Save workout with AI-generated session summary
+        workout_data["ai_summary"] = reflection.get("session_summary", "")
+    except Exception as exc:
+        logger.error("AI reflection failed, saving workout without summary: %s", exc)
+
+    # Step 4: Save the workout document
+    try:
+        document = await cosmos_service.save_workout(workout_data)
     except Exception as exc:
         logger.error("Cosmos DB save failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to save workout")
@@ -63,22 +101,37 @@ async def save_workout(request: SaveWorkoutRequest):
 async def chat_with_ai(request: ChatRequest, http_request: Request):
     try:
         from openai import AsyncAzureOpenAI
-
         from api.config import get_settings
 
         settings = get_settings()
         lang = http_request.headers.get("accept-language", "en-US")
         language = "Chinese" if lang.startswith("zh") else "English"
 
+        # Fetch user profile for context
+        try:
+            user_profile = await cosmos_service.get_user_profile()
+            profile_context = (
+                f" The user's known weak points: {user_profile.get('weak_points_and_reminders', 'None')}."
+                f" Their current doubts: {user_profile.get('current_doubts', 'None')}."
+            )
+        except Exception:
+            user_profile = {}
+            profile_context = ""
+
         client = AsyncAzureOpenAI(
             azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
             api_key=settings["AZURE_OPENAI_KEY"],
-            api_version="2024-10-21",
+            api_version=settings["AZURE_OPENAI_API_VERSION"],
         )
 
         system_msg = {
             "role": "system",
-            "content": f"You are a friendly, expert fitness coach assistant. Give brief, practical advice about exercise form, technique, nutrition, and workout optimization. Keep responses concise (2-3 sentences max) since users are reading this during their workout. Respond in {language}.",
+            "content": (
+                f"You are a friendly, expert fitness coach assistant. Give brief, practical advice about "
+                f"exercise form, technique, nutrition, and workout optimization. Keep responses concise "
+                f"(2-3 sentences max) since users are reading this during their workout.{profile_context} "
+                f"Respond in {language}."
+            ),
         }
         messages = [system_msg] + [
             {"role": m.role, "content": m.content} for m in request.messages
@@ -91,7 +144,33 @@ async def chat_with_ai(request: ChatRequest, http_request: Request):
             max_tokens=200,
         )
 
-        return {"reply": response.choices[0].message.content}
+        reply = response.choices[0].message.content
+
+        # Background task: extract insights from conversation
+        conversation = [{"role": m.role, "content": m.content} for m in request.messages]
+        conversation.append({"role": "assistant", "content": reply})
+
+        async def _extract_and_update():
+            try:
+                profile = user_profile or await cosmos_service.get_user_profile()
+                insights = await gemini_service.extract_chat_insights(conversation, profile)
+                if insights.get("has_new_insights"):
+                    existing_weak = profile.get("weak_points_and_reminders", "")
+                    existing_doubts = profile.get("current_doubts", "")
+                    new_weak = existing_weak
+                    if insights.get("weak_points_to_append"):
+                        new_weak = f"{existing_weak}; {insights['weak_points_to_append']}" if existing_weak else insights["weak_points_to_append"]
+                    new_doubts = existing_doubts
+                    if insights.get("doubts_to_append"):
+                        new_doubts = f"{existing_doubts}; {insights['doubts_to_append']}" if existing_doubts else insights["doubts_to_append"]
+                    await cosmos_service.update_user_profile(new_weak, new_doubts)
+                    logger.info("Chat insights extracted and profile updated")
+            except Exception as exc:
+                logger.warning("Background chat insight extraction failed: %s", exc)
+
+        asyncio.create_task(_extract_and_update())
+
+        return {"reply": reply}
     except Exception as exc:
         logger.error("Chat API failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to get AI response")
@@ -113,7 +192,7 @@ async def suggest_alternatives(request: SuggestAlternativesRequest, http_request
         client = AsyncAzureOpenAI(
             azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
             api_key=settings["AZURE_OPENAI_KEY"],
-            api_version="2024-10-21",
+            api_version=settings["AZURE_OPENAI_API_VERSION"],
         )
 
         existing_names = ", ".join(

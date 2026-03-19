@@ -1,7 +1,7 @@
 from azure.cosmos.aio import CosmosClient
 
 from api.config import get_settings
-from api.models.schemas import WorkoutDocument
+from api.models.schemas import WorkoutDocument, UserProfile
 
 
 async def _get_container():
@@ -54,3 +54,48 @@ async def save_workout(data: dict) -> dict:
         await container.upsert_item(document)
 
     return document
+
+
+async def get_user_profile() -> dict:
+    """Get the singleton user profile, creating it with defaults if missing."""
+    async with CosmosClient(
+        url=get_settings()["COSMOS_ENDPOINT"],
+        credential=get_settings()["COSMOS_KEY"],
+    ) as client:
+        database = client.get_database_client(get_settings()["COSMOS_DATABASE"])
+        container = database.get_container_client(get_settings()["COSMOS_CONTAINER"])
+
+        try:
+            item = await container.read_item(
+                item="user_knowledge_base",
+                partition_key="global_profile",
+            )
+            return item
+        except Exception:
+            # Document doesn't exist yet — create with defaults
+            default_profile = UserProfile().model_dump()
+            await container.upsert_item(default_profile)
+            return default_profile
+
+
+async def update_user_profile(weak_points: str, current_doubts: str) -> dict:
+    """Update the singleton user profile with new AI-extracted insights."""
+    async with CosmosClient(
+        url=get_settings()["COSMOS_ENDPOINT"],
+        credential=get_settings()["COSMOS_KEY"],
+    ) as client:
+        database = client.get_database_client(get_settings()["COSMOS_DATABASE"])
+        container = database.get_container_client(get_settings()["COSMOS_CONTAINER"])
+
+        try:
+            profile = await container.read_item(
+                item="user_knowledge_base",
+                partition_key="global_profile",
+            )
+        except Exception:
+            profile = UserProfile().model_dump()
+
+        profile["weak_points_and_reminders"] = weak_points
+        profile["current_doubts"] = current_doubts
+        await container.upsert_item(profile)
+        return profile
