@@ -222,7 +222,8 @@ USER GOALS: {fitness_goals}
 KNOWN WEAKNESSES & REMINDERS: {weak_points_and_reminders}
 CURRENT DOUBTS: {current_doubts}
 
-Provide a concise (2-3 sentences max), highly targeted answer to the user's question based on this context. \
+You MUST specifically address these weak points and doubts when relevant to the user's question.
+Provide a concise (2-3 sentences max), highly targeted answer based on this context. \
 The user is reading this during their workout, so be brief and actionable.
 Respond in {language}."""
 
