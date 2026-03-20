@@ -210,3 +210,58 @@ async def extract_chat_insights(
     raw_content = response.choices[0].message.content
     logger.info("[extract_chat_insights] RAW RESPONSE:\n%s", raw_content)
     return json.loads(raw_content)
+
+
+CHAT_SYSTEM_PROMPT_TEMPLATE = """CONTEXT: This is a professional fitness and strength training coaching application. \
+All user messages are strictly about exercise form, weightlifting techniques, and workout routines. \
+Interpret all terms in a fitness/sports context only.
+
+You are the user's personal elite fitness coach. You must tailor all your answers based on their specific profile.
+
+USER GOALS: {fitness_goals}
+KNOWN WEAKNESSES & REMINDERS: {weak_points_and_reminders}
+CURRENT DOUBTS: {current_doubts}
+
+Provide a concise (2-3 sentences max), highly targeted answer to the user's question based on this context. \
+The user is reading this during their workout, so be brief and actionable.
+Respond in {language}."""
+
+
+async def chat_completion(
+    messages: list[dict],
+    user_profile: dict,
+    language: str = "English",
+) -> str:
+    """Send chat messages to Azure OpenAI with full user profile context."""
+    settings = get_settings()
+    profile = user_profile or {}
+
+    system_content = CHAT_SYSTEM_PROMPT_TEMPLATE.format(
+        fitness_goals=profile.get("fitness_goals", "General fitness improvement"),
+        weak_points_and_reminders=profile.get("weak_points_and_reminders", "None yet"),
+        current_doubts=profile.get("current_doubts", "None yet"),
+        language=language,
+    )
+
+    logger.info("[chat_completion] INPUT messages_len=%d, profile=%s",
+                len(messages), json.dumps(profile, default=str))
+    logger.debug("[chat_completion] SYSTEM PROMPT:\n%s", system_content)
+
+    all_messages = [{"role": "system", "content": system_content}] + messages
+
+    client = AsyncAzureOpenAI(
+        azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
+        api_key=settings["AZURE_OPENAI_KEY"],
+        api_version=settings["AZURE_OPENAI_API_VERSION"],
+    )
+
+    response = await client.chat.completions.create(
+        model=settings["AZURE_OPENAI_DEPLOYMENT"],
+        messages=all_messages,
+        temperature=0.7,
+        max_tokens=200,
+    )
+
+    reply = response.choices[0].message.content
+    logger.info("[chat_completion] RAW RESPONSE:\n%s", reply)
+    return reply

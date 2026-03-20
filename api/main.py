@@ -1,7 +1,6 @@
-import asyncio
 import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 
 from api.auth import verify_api_key
 from api.models.schemas import (
@@ -98,93 +97,96 @@ async def save_workout(request: SaveWorkoutRequest, http_request: Request):
 
 
 @app.post("/api/chat")
-async def chat_with_ai(request: ChatRequest, http_request: Request):
+async def chat_with_ai(
+    request: ChatRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+):
+    lang = http_request.headers.get("accept-language", "en-US")
+    language = "Chinese" if lang.startswith("zh") else "English"
+
+    # Phase 1: Fetch user profile and call AI with full context
     try:
-        from openai import AsyncAzureOpenAI
-        from api.config import get_settings
+        user_profile = await cosmos_service.get_user_profile()
+    except Exception as exc:
+        logger.warning("Failed to fetch user profile for chat: %s", exc)
+        user_profile = {}
 
-        settings = get_settings()
-        lang = http_request.headers.get("accept-language", "en-US")
-        language = "Chinese" if lang.startswith("zh") else "English"
-
-        # Fetch user profile for context
-        try:
-            user_profile = await cosmos_service.get_user_profile()
-            profile_context = (
-                f" The user's known weak points: {user_profile.get('weak_points_and_reminders', 'None')}."
-                f" Their current doubts: {user_profile.get('current_doubts', 'None')}."
-            )
-        except Exception:
-            user_profile = {}
-            profile_context = ""
-
-        client = AsyncAzureOpenAI(
-            azure_endpoint=settings["AZURE_OPENAI_ENDPOINT"],
-            api_key=settings["AZURE_OPENAI_KEY"],
-            api_version=settings["AZURE_OPENAI_API_VERSION"],
-        )
-
-        system_msg = {
-            "role": "system",
-            "content": (
-                f"CONTEXT: This is a professional fitness and strength training coaching application. "
-                f"All user messages are strictly about exercise form, weightlifting techniques, and workout routines. "
-                f"Interpret all terms in a fitness/sports context only.\n\n"
-                f"You are a friendly, expert fitness coach assistant. Give brief, practical advice about "
-                f"exercise form, technique, nutrition, and workout optimization. Keep responses concise "
-                f"(2-3 sentences max) since users are reading this during their workout.{profile_context} "
-                f"Respond in {language}."
-            ),
-        }
-        messages = [system_msg] + [
-            {"role": m.role, "content": m.content} for m in request.messages
-        ]
-
-        response = await client.chat.completions.create(
-            model=settings["AZURE_OPENAI_DEPLOYMENT"],
+    try:
+        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        reply = await gemini_service.chat_completion(
             messages=messages,
-            temperature=0.7,
-            max_tokens=200,
+            user_profile=user_profile,
+            language=language,
         )
-
-        reply = response.choices[0].message.content
-
-        # Background task: extract insights from conversation
-        conversation = [{"role": m.role, "content": m.content} for m in request.messages]
-        conversation.append({"role": "assistant", "content": reply})
-
-        async def _extract_and_update():
-            try:
-                profile = user_profile or await cosmos_service.get_user_profile()
-                logger.info("[_extract_and_update] Starting insight extraction, conversation_len=%d", len(conversation))
-                insights = await gemini_service.extract_chat_insights(conversation, profile)
-                logger.info("[_extract_and_update] Insights result: %s", insights)
-                if insights.get("has_new_insights"):
-                    existing_weak = profile.get("weak_points_and_reminders", "")
-                    existing_doubts = profile.get("current_doubts", "")
-                    new_weak = existing_weak
-                    if insights.get("weak_points_to_append"):
-                        new_weak = f"{existing_weak}; {insights['weak_points_to_append']}" if existing_weak else insights["weak_points_to_append"]
-                    new_doubts = existing_doubts
-                    if insights.get("doubts_to_append"):
-                        new_doubts = f"{existing_doubts}; {insights['doubts_to_append']}" if existing_doubts else insights["doubts_to_append"]
-                    await cosmos_service.update_user_profile(new_weak, new_doubts)
-                    logger.info("[_extract_and_update] Profile updated — weak_points: %s, doubts: %s", new_weak, new_doubts)
-                else:
-                    logger.info("[_extract_and_update] No new insights found, skipping profile update")
-            except Exception as exc:
-                logger.error("[_extract_and_update] Background chat insight extraction failed: %s", exc, exc_info=True)
-
-        asyncio.create_task(_extract_and_update())
-
-        return {"reply": reply}
     except Exception as exc:
         logger.error("Chat API failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to get AI response")
 
+    # Phase 2: Background task for continuous learning
+    conversation = messages + [{"role": "assistant", "content": reply}]
+    background_tasks.add_task(
+        _extract_and_update_profile, conversation, user_profile
+    )
+
+    return {"reply": reply}
+
+
+async def _extract_and_update_profile(
+    conversation: list[dict], user_profile: dict
+):
+    """Background task: extract insights from chat and update user profile."""
+    try:
+        profile = user_profile or await cosmos_service.get_user_profile()
+        logger.info(
+            "[_extract_and_update] Starting insight extraction, conversation_len=%d",
+            len(conversation),
+        )
+        insights = await gemini_service.extract_chat_insights(conversation, profile)
+        logger.info("[_extract_and_update] Insights result: %s", insights)
+
+        if insights.get("has_new_insights"):
+            existing_weak = profile.get("weak_points_and_reminders", "")
+            existing_doubts = profile.get("current_doubts", "")
+
+            new_weak = existing_weak
+            if insights.get("weak_points_to_append"):
+                new_weak = (
+                    f"{existing_weak}; {insights['weak_points_to_append']}"
+                    if existing_weak
+                    else insights["weak_points_to_append"]
+                )
+
+            new_doubts = existing_doubts
+            if insights.get("doubts_to_append"):
+                new_doubts = (
+                    f"{existing_doubts}; {insights['doubts_to_append']}"
+                    if existing_doubts
+                    else insights["doubts_to_append"]
+                )
+
+            await cosmos_service.update_user_profile(new_weak, new_doubts)
+            logger.info(
+                "[_extract_and_update] Profile updated - weak_points: %s, doubts: %s",
+                new_weak,
+                new_doubts,
+            )
+        else:
+            logger.info(
+                "[_extract_and_update] No new insights found, skipping profile update"
+            )
+    except Exception as exc:
+        logger.error(
+            "[_extract_and_update] Background chat insight extraction failed: %s",
+            exc,
+            exc_info=True,
+        )
+
 
 @app.post("/api/suggest-alternatives", response_model=SuggestAlternativesResponse)
-async def suggest_alternatives(request: SuggestAlternativesRequest, http_request: Request):
+async def suggest_alternatives(
+    request: SuggestAlternativesRequest, http_request: Request
+):
     try:
         import json
 
@@ -206,33 +208,24 @@ async def suggest_alternatives(request: SuggestAlternativesRequest, http_request
             e.get("exercise_name", "") for e in request.current_plan
         )
 
-        system_prompt = f"""You are an elite strength and conditioning coach. The user wants to replace an exercise in their workout plan.
-
-Current exercise to replace: {request.exercise_name}
-Target muscle group: {request.body_part}
-Reason for replacement: {request.reason}
-Other exercises already in the plan (avoid duplicates): {existing_names}
-
-Generate exactly 3 alternative exercises that:
-1. Target the same muscle group ({request.body_part})
-2. Are NOT already in the current plan
-3. Provide similar or better training stimulus
-4. Include progressive overload suggestions
-
-Output strictly in valid JSON format:
-{{
-  "alternatives": [
-    {{
-      "exercise_name": "String",
-      "target_sets": Integer,
-      "target_reps": "String (e.g., 8-10)",
-      "suggested_weight": "String",
-      "coach_tip": "String (why this is a good alternative)"
-    }}
-  ]
-}}
-
-IMPORTANT: Respond entirely in {language}. All exercise names, coach tips must be in {language}."""
+        system_prompt = (
+            f"You are an elite strength and conditioning coach. "
+            f"The user wants to replace an exercise in their workout plan.\n\n"
+            f"Current exercise to replace: {request.exercise_name}\n"
+            f"Target muscle group: {request.body_part}\n"
+            f"Reason for replacement: {request.reason}\n"
+            f"Other exercises already in the plan (avoid duplicates): {existing_names}\n\n"
+            f"Generate exactly 3 alternative exercises that:\n"
+            f"1. Target the same muscle group ({request.body_part})\n"
+            f"2. Are NOT already in the current plan\n"
+            f"3. Provide similar or better training stimulus\n"
+            f"4. Include progressive overload suggestions\n\n"
+            f"Output strictly in valid JSON format:\n"
+            f'{{"alternatives": [{{"exercise_name": "String", "target_sets": "Integer", '
+            f'"target_reps": "String (e.g., 8-10)", "suggested_weight": "String", '
+            f'"coach_tip": "String (why this is a good alternative)"}}]}}\n\n'
+            f"IMPORTANT: Respond entirely in {language}. All exercise names, coach tips must be in {language}."
+        )
 
         response = await client.chat.completions.create(
             model=settings["AZURE_OPENAI_DEPLOYMENT"],
@@ -250,4 +243,6 @@ IMPORTANT: Respond entirely in {language}. All exercise names, coach tips must b
         )
     except Exception as exc:
         logger.error("Suggest alternatives API failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Failed to generate alternative exercises")
+        raise HTTPException(
+            status_code=502, detail="Failed to generate alternative exercises"
+        )
